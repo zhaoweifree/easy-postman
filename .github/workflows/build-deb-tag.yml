@@ -1,0 +1,183 @@
+name: Build DEB from Ref（按指定版本构建 DEB）
+
+# 用途：从任意 tag / 分支 / commit 构建 Debian 安装包，分别产出 amd64 / arm64。
+# 与 release.yml 的区别：
+#   - 可指定 ref（release.yml 的 workflow_dispatch 只允许默认分支）
+#   - 只跑 DEB 相关步骤，不需要 GITEE_TOKEN，不触发其它平台构建
+#   - 强制把 control.tar / data.tar 重压为 xz，兼容老系统 dpkg
+#   - jlink 裁剪的 JRE 17 直接内置在包里，目标机器无需安装 Java
+
+permissions:
+  contents: read
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Git ref to build (tag / branch / commit SHA)'
+        required: true
+        default: 'master'
+
+env:
+  JAVA_VERSION: '17'
+  JAVA_DISTRIBUTION: 'jetbrains'
+  JLINK_MODULES: 'java.base,java.desktop,java.logging,jdk.unsupported,java.naming,java.net.http,jdk.httpserver,java.prefs,java.sql,java.security.sasl,java.security.jgss,jdk.crypto.ec,java.management,java.management.rmi,jdk.crypto.cryptoki'
+  JAVA_OPTIONS: '-Xms256m|-Xmx1g|-XX:MaxMetaspaceSize=256m|-XX:MetaspaceSize=128m|-XX:MaxDirectMemorySize=256m|-XX:+UseG1GC|-XX:MaxGCPauseMillis=200|-XX:InitiatingHeapOccupancyPercent=45|-XX:+UseStringDeduplication|-XX:+HeapDumpOnOutOfMemoryError|-XX:HeapDumpPath=./dumps|-Dfile.encoding=UTF-8|-Dawt.useSystemAAFontSettings=on|-Dswing.aatext=true|-Djava.net.preferIPv4Stack=true|-Dhttp.keepAlive=true|--add-opens=java.desktop/sun.awt.X11=ALL-UNNAMED'
+
+jobs:
+  build-jar:
+    name: Build Fat JAR（构建跨平台 JAR）
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Checkout ref
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Setup Java
+        uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          distribution: ${{ env.JAVA_DISTRIBUTION }}
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: 'maven'
+          check-latest: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve version
+        id: version
+        run: |
+          VERSION=$(mvn help:evaluate -Dexpression=project.version -q -DforceStdout)
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Building version: $VERSION from ref ${{ inputs.ref }}"
+
+      - name: Build with Maven
+        run: mvn -B clean package -DskipTests
+
+      - name: Upload JAR
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: app-jar-ref
+          path: easy-postman-app/target/easy-postman-${{ steps.version.outputs.version }}.jar
+          retention-days: 1
+          if-no-files-found: error
+
+  build-deb:
+    name: Build DEB ${{ matrix.arch }}（构建 ${{ matrix.arch }} 安装包）
+    needs: build-jar
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-22.04
+          - arch: arm64
+            runner: ubuntu-22.04-arm
+    steps:
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y binutils xz-utils zstd
+
+      - name: Setup Java
+        uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          distribution: ${{ env.JAVA_DISTRIBUTION }}
+          java-version: ${{ env.JAVA_VERSION }}
+          check-latest: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download Fat JAR
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: app-jar-ref
+          path: target
+
+      - name: Create runtime with jlink（内置 JRE）
+        run: |
+          rm -rf target/runtime
+          jlink \
+            --add-modules ${{ env.JLINK_MODULES }} \
+            --strip-debug \
+            --no-header-files \
+            --no-man-pages \
+            --compress=2 \
+            --output target/runtime
+          test -x target/runtime/bin/java
+
+      - name: Prepare dist-input
+        run: |
+          VERSION="${{ needs.build-jar.outputs.version }}"
+          mkdir -p target/dist-input dist
+          cp "target/easy-postman-${VERSION}.jar" target/dist-input/easy-postman.jar
+
+      - name: Create DEB with jpackage
+        run: |
+          VERSION="${{ needs.build-jar.outputs.version }}"
+          IFS='|' read -ra JAVA_OPTS <<< "${{ env.JAVA_OPTIONS }}"
+          JPACKAGE_ARGS=(
+            --input target/dist-input
+            --main-jar easy-postman.jar
+            --main-class com.laker.postman.App
+            --runtime-image target/runtime
+            --type deb
+            --name EasyPostman
+            --app-version "$VERSION"
+            --dest dist
+            --vendor "Laker"
+            --copyright "© 2025 Laker"
+            --description "A modern API testing tool similar to Postman"
+            --linux-shortcut
+            --linux-menu-group "Development"
+            --linux-app-category "Development"
+          )
+          for opt in "${JAVA_OPTS[@]}"; do
+            JPACKAGE_ARGS+=(--java-options "$opt")
+          done
+          jpackage "${JPACKAGE_ARGS[@]}"
+
+      - name: Normalize compression to xz（兼容老系统 dpkg）
+        run: |
+          VERSION="${{ needs.build-jar.outputs.version }}"
+          RAW_DEB=$(find dist -maxdepth 1 -type f -name '*.deb' | sort | tail -n 1)
+          if [ -z "$RAW_DEB" ]; then
+            echo "No DEB produced by jpackage" >&2
+            exit 1
+          fi
+
+          # dpkg-deb -R 能读取 zstd；用它解包后强制以 xz 重建。
+          rm -rf deb-root
+          mkdir -p deb-root
+          dpkg-deb -R "$RAW_DEB" deb-root
+          rm -f "$RAW_DEB"
+
+          TARGET_DEB="dist/EasyPostman-${VERSION}-linux-${{ matrix.arch }}.deb"
+          dpkg-deb -Zxz --root-owner-group --build deb-root "$TARGET_DEB"
+
+          echo "DEB members:"
+          ar t "$TARGET_DEB"
+          if ar t "$TARGET_DEB" | grep -q '\.zst$'; then
+            echo "zstd member still present, refusing to publish" >&2
+            exit 1
+          fi
+          dpkg-deb -I "$TARGET_DEB"
+
+          # 断言内置运行时确实打进包里
+          if ! dpkg-deb -c "$TARGET_DEB" | grep -q '/opt/easypostman/lib/runtime/bin/java'; then
+            echo "Embedded JRE is missing from the package" >&2
+            exit 1
+          fi
+
+          ls -l "$TARGET_DEB"
+          sha256sum "$TARGET_DEB"
+
+      - name: Upload DEB artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: EasyPostman-DEB-${{ matrix.arch }}
+          path: dist/*-linux-${{ matrix.arch }}.deb
+          retention-days: 7
