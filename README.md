@@ -81,7 +81,7 @@ winget upgrade --id Laker.EasyPostman --exact
 | macOS Intel | `EasyPostman-{version}-macos-x86_64.dmg` |
 | Windows installer / portable | `EasyPostman-{version}-windows-x64.exe` / `-portable.zip` |
 | Debian / Ubuntu x64 | `EasyPostman-{version}-linux-amd64.deb` |
-| Debian / Ubuntu ARM64 | `EasyPostman-{version}-linux-arm64.deb`; use `-compat.deb` only for older incompatible `dpkg` versions |
+| Debian / Ubuntu ARM64 | `EasyPostman-{version}-linux-arm64.deb` |
 | RHEL / Rocky / CentOS / Fedora | `EasyPostman-{version}-1.x86_64.rpm` or `-1.aarch64.rpm` |
 | Cross-platform JAR | `easy-postman-{version}.jar`, requires Java 17+ |
 

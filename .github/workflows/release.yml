@@ -763,20 +763,32 @@ jobs:
           # 执行 jpackage
           jpackage "${JPACKAGE_ARGS[@]}"
 
-      - name: Rename amd64 DEB to stable release name（统一 amd64 包名）
+      - name: Normalize DEB compression to xz（统一为 xz，兼容老系统 dpkg）
         run: |
           VERSION="${{ needs.get-version.outputs.version }}"
           ORIGINAL_DEB=$(find dist -maxdepth 1 -type f -name "*.deb" | sort | tail -n 1)
           if [ -z "$ORIGINAL_DEB" ]; then
-            echo "No DEB file available for renaming" >&2
+            echo "No DEB file available for repacking" >&2
             exit 1
           fi
 
           TARGET_DEB="dist/EasyPostman-${VERSION}-linux-amd64.deb"
           mv "$ORIGINAL_DEB" "$TARGET_DEB"
 
+          # jpackage 在 Ubuntu 24.04+ 上会用 zstd 压缩 control.tar/data.tar，
+          # 老系统 dpkg 直接报 "unknown compression for member control.tar.zst"
+          bash build/repack-deb-to-xz.sh "$TARGET_DEB" xz
+
+          echo "DEB members (must not contain .zst):"
+          ar t "$TARGET_DEB"
+          if ar t "$TARGET_DEB" | grep -q '\.zst$'; then
+            echo "zstd member still present, refusing to publish" >&2
+            exit 1
+          fi
+          dpkg-deb -I "$TARGET_DEB"
           echo "Generated amd64 DEB:"
-          ls -1 "$TARGET_DEB"
+          ls -l "$TARGET_DEB"
+          sha256sum "$TARGET_DEB"
 
       - name: Upload as Artifact（上传为构建产物）
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -813,8 +825,8 @@ jobs:
       - name: Install dependencies（安装系统依赖）
         run: |
           sudo apt-get update
-          # 安装 GTK3、WebKit 和打包工具
-          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.0-dev binutils
+          # 安装 GTK3、WebKit、打包工具，以及 DEB 重压缩所需压缩工具
+          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.0-dev binutils zstd xz-utils
 
       - name: Create runtime with jlink（使用 jlink 创建 Linux 精简 JRE）
         run: |
@@ -879,35 +891,38 @@ jobs:
           # 执行 jpackage
           jpackage "${JPACKAGE_ARGS[@]}"
 
-      - name: Create generic and compatibility ARM64 variants（生成通用 ARM64 和兼容版安装包）
+      - name: Normalize DEB compression to xz（统一为 xz，兼容老系统 dpkg）
         run: |
           VERSION="${{ needs.get-version.outputs.version }}"
           ORIGINAL_DEB=$(find dist -maxdepth 1 -type f -name "*.deb" | sort | tail -n 1)
           if [ -z "$ORIGINAL_DEB" ]; then
-            echo "No DEB file available for renaming" >&2
+            echo "No DEB file available for repacking" >&2
             exit 1
           fi
 
-          GENERIC_DEB="dist/EasyPostman-${VERSION}-linux-arm64.deb"
-          COMPAT_DEB="dist/EasyPostman-${VERSION}-linux-arm64-compat.deb"
+          TARGET_DEB="dist/EasyPostman-${VERSION}-linux-arm64.deb"
+          mv "$ORIGINAL_DEB" "$TARGET_DEB"
 
-          mv "$ORIGINAL_DEB" "$GENERIC_DEB"
-          cp "$GENERIC_DEB" "$COMPAT_DEB"
+          # jpackage 在 Ubuntu 24.04+ 上会用 zstd 压缩 control.tar/data.tar，
+          # 老系统 dpkg 直接报 "unknown compression for member control.tar.zst"
+          bash build/repack-deb-to-xz.sh "$TARGET_DEB" xz
 
-          bash build/repack-deb-to-xz.sh "$COMPAT_DEB"
-
-          echo "Generated ARM64 packages:"
-          ls -1 "$GENERIC_DEB" "$COMPAT_DEB"
-          echo "Compatibility package members:"
-          ar t "$COMPAT_DEB"
+          echo "DEB members (must not contain .zst):"
+          ar t "$TARGET_DEB"
+          if ar t "$TARGET_DEB" | grep -q '\.zst$'; then
+            echo "zstd member still present, refusing to publish" >&2
+            exit 1
+          fi
+          dpkg-deb -I "$TARGET_DEB"
+          echo "Generated ARM64 DEB:"
+          ls -l "$TARGET_DEB"
+          sha256sum "$TARGET_DEB"
 
       - name: Upload as Artifact（上传为构建产物）
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: EasyPostman-Ubuntu-DEB-arm64
-          path: |
-            dist/*-linux-arm64.deb
-            dist/*-linux-arm64-compat.deb
+          path: dist/*-linux-arm64.deb
           retention-days: 7
 
   build-rpm-amd64:

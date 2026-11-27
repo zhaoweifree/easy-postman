@@ -1,64 +1,87 @@
 #!/bin/bash
+#
+# Debian / Ubuntu / 麒麟 / openEuler 等 DEB 系统打包脚本。
+#
+# 产物架构跟随当前打包机器（amd64 / arm64），文件名统一为：
+#   dist/EasyPostman-${VERSION}-linux-${ARCH}.deb
+#
+# 兼容性约定（重要）：
+#   jpackage 生成 DEB 时调用系统 dpkg-deb，而 dpkg >= 1.21.18（Ubuntu 24.04+）
+#   默认使用 zstd 压缩，老系统的 dpkg 会直接拒绝安装：
+#     dpkg-deb: 错误: 归档 xxx.deb 对成员 control.tar.zst 使用了未知的压缩，放弃操作
+#   所以这里打包完成后强制把 control/data 成员重压为 xz（dpkg >= 1.17 均支持），
+#   并在脚本末尾做结构自检；可用 DEB_COMPRESSION=gzip 进一步兼容极老环境。
+#
+# 用法：
+#   bash build/linux-deb.sh                  # 默认 xz
+#   DEB_COMPRESSION=gzip bash build/linux-deb.sh
+#   SKIP_BUILD=1 bash build/linux-deb.sh     # 复用已有 target/ 产物，跳过 mvn
 
-# Ubuntu/Debian 系统 DEB 包打包脚本
+set -euo pipefail
 
 # 检查 java 是否可用
 if ! command -v java &> /dev/null; then
     echo "❌ 未检测到 java，请先安装 JDK 17+ 并配置环境变量。"
     exit 1
 fi
-# 检查 mvn 是否可用
-if ! command -v mvn &> /dev/null; then
-    echo "❌ 未检测到 mvn，请先安装 Maven 并配置环境变量。"
-    exit 1
-fi
-# 检查 jlink 是否可用
-if ! command -v jlink &> /dev/null; then
-    echo "❌ 未检测到 jlink，请确认 JDK 17+ 已正确安装。"
-    exit 1
-fi
-# 检查 jpackage 是否可用
-if ! command -v jpackage &> /dev/null; then
-    echo "❌ 未检测到 jpackage，请确认 JDK 17+ 已正确安装。"
-    exit 1
-fi
-# 检查 objcopy 是否可用（jlink 需要）
+# 检查 jlink / jpackage / objcopy
+for bin in jlink jpackage; do
+    if ! command -v "$bin" &> /dev/null; then
+        echo "❌ 未检测到 $bin，请确认 JDK 17+ 已正确安装。"
+        exit 1
+    fi
+done
 if ! command -v objcopy &> /dev/null; then
-    echo "❌ 未检测到 objcopy，请先安装 binutils："
-    echo "   sudo apt-get install binutils"
+    echo "❌ 未检测到 objcopy，请先安装 binutils：sudo apt-get install binutils"
     exit 1
 fi
-# 获取项目根目录路径（包含 pom.xml）
-PROJECT_ROOT=$(cd "$(dirname "$0")/.."; pwd)
+# 重压缩所需的工具
+for bin in ar tar xz gzip; do
+    if ! command -v "$bin" &> /dev/null; then
+        echo "❌ 未检测到 $bin，请先安装：sudo apt-get install binutils xz-utils"
+        exit 1
+    fi
+done
 
-# 切换到项目根目录并读取版本号
+PROJECT_ROOT=$(cd "$(dirname "$0")/.."; pwd)
 cd "$PROJECT_ROOT" || exit 1
-# 直接从 pom.xml 解析 revision
+
 VERSION=$(grep -m 1 '<revision>' pom.xml | sed 's/.*<revision>\(.*\)<\/revision>.*/\1/')
-echo "🔧 开始打包 EasyPostman DEB 包，版本: $VERSION"
+DEB_COMPRESSION="${DEB_COMPRESSION:-xz}"
+SKIP_BUILD="${SKIP_BUILD:-0}"
+
 APP_NAME="EasyPostman"
 JAR_NAME_WITH_VERSION="easy-postman-$VERSION.jar"
 JAR_NAME="easy-postman.jar"  # 固定名称，不带版本号
 MAIN_CLASS="com.laker.postman.App"
-ICON_DIR="assets/linux/EasyPostman.png"
 OUTPUT_DIR="dist"
 APP_TARGET_DIR="easy-postman-app/target"
 
+# 目标架构：以 dpkg 为准，保证 control 里的 Architecture 与文件名一致
+ARCH=$(dpkg --print-architecture 2>/dev/null || true)
+if [ -z "$ARCH" ]; then
+    case "$(uname -m)" in
+        x86_64|amd64) ARCH="amd64" ;;
+        aarch64|arm64) ARCH="arm64" ;;
+        *) ARCH="$(uname -m)" ;;
+    esac
+fi
+
+echo "🔧 开始打包 EasyPostman DEB 包，版本: $VERSION，架构: $ARCH，压缩: $DEB_COMPRESSION"
+
 # 检查 JDK 版本是否 >= 17
-JAVA_VERSION=$(java -version 2>&1 | grep version | awk '{print substr($3, 2, 3)}' | tr -d '"')
-if (( $(echo "$JAVA_VERSION < 17" | bc -l) )); then
-    echo "❌ 需要 JDK 17 或更高版本。当前版本: $JAVA_VERSION"
+JAVA_MAJOR=$(java -version 2>&1 | sed -n 's/.*version "\([0-9][0-9]*\).*/\1/p' | head -n 1)
+if [ -n "$JAVA_MAJOR" ] && [ "$JAVA_MAJOR" -lt 17 ]; then
+    echo "❌ 需要 JDK 17 或更高版本。当前版本: $JAVA_MAJOR"
     exit 1
 fi
 
 # Step 1: 清理 & 构建项目
-echo "🚀 开始构建项目..."
-mvn clean package -DskipTests=false
-if [ $? -ne 0 ]; then
-    echo "❌ Maven 构建失败，请检查错误日志"
-    exit 1
+if [ "$SKIP_BUILD" != "1" ]; then
+    echo "🚀 开始构建项目..."
+    mvn clean package -DskipTests=false
 fi
-# 检查 jar 包是否生成成功
+
 if [ ! -f "${APP_TARGET_DIR}/$JAR_NAME_WITH_VERSION" ]; then
     echo "❌ 构建未生成 jar 包: ${APP_TARGET_DIR}/$JAR_NAME_WITH_VERSION"
     exit 1
@@ -79,11 +102,6 @@ jlink \
     --compress=2 \
     --output target/runtime
 
-if [ $? -ne 0 ]; then
-    echo "❌ jlink 创建失败"
-    exit 1
-fi
-
 # Step 3: 准备输出目录
 mkdir -p ${OUTPUT_DIR}
 
@@ -95,6 +113,10 @@ cp "${APP_TARGET_DIR}/${JAR_NAME}" ${DIST_INPUT_DIR}/
 
 # Step 5: 使用 jpackage 打包 DEB
 echo "📦 使用 jpackage 打包 DEB 包..."
+JPACKAGE_DEB_DIR="target/deb-raw"
+rm -rf "$JPACKAGE_DEB_DIR"
+mkdir -p "$JPACKAGE_DEB_DIR"
+
 jpackage \
     --input ${DIST_INPUT_DIR} \
     --main-jar ${JAR_NAME} \
@@ -104,7 +126,7 @@ jpackage \
     --type deb \
     --name "${APP_NAME}" \
     --app-version "${VERSION}" \
-    --dest "${OUTPUT_DIR}" \
+    --dest "${JPACKAGE_DEB_DIR}" \
     --vendor "Laker" \
     --copyright "© 2025 Laker" \
     --description "A modern API testing tool similar to Postman" \
@@ -128,26 +150,40 @@ jpackage \
     --java-options "-Dhttp.keepAlive=true" \
     --java-options "--add-opens=java.desktop/sun.awt.X11=ALL-UNNAMED"
 
-if [ $? -ne 0 ]; then
-    echo "❌ jpackage 打包失败"
+RAW_DEB=$(find "${JPACKAGE_DEB_DIR}" -maxdepth 1 -type f -name "*.deb" | sort | tail -n 1)
+if [ -z "$RAW_DEB" ]; then
+    echo "❌ jpackage 未产出 DEB 文件"
     exit 1
 fi
 
-# 自动识别 jpackage 产出的 DEB 文件名，避免架构提示写死为 amd64
-DEB_FILE=$(find "${OUTPUT_DIR}" -maxdepth 1 -type f -name "*.deb" | sort | tail -n 1)
+# Step 6: 统一压缩格式 + 统一命名
+DEB_FILE="${OUTPUT_DIR}/EasyPostman-${VERSION}-linux-${ARCH}.deb"
+rm -f "$DEB_FILE"
+cp "$RAW_DEB" "$DEB_FILE"
 
-if [ -n "${DEB_FILE}" ]; then
-    echo "📦 生成 DEB: ${DEB_FILE}"
+echo "🧩 统一 DEB 成员压缩为 ${DEB_COMPRESSION}（避免老系统 dpkg 不认识 zstd）..."
+bash build/repack-deb-to-xz.sh "$DEB_FILE" "$DEB_COMPRESSION"
+
+# Step 7: 结构自检
+echo "🔍 校验 DEB 结构..."
+MEMBERS=$(ar t "$DEB_FILE")
+if echo "$MEMBERS" | grep -q '\.zst$'; then
+    echo "❌ 校验失败：产物仍包含 zstd 成员"
+    exit 1
+fi
+if ! echo "$MEMBERS" | grep -q "^control\.tar\.\(xz\|gz\)$"; then
+    echo "❌ 校验失败：control.tar 格式异常"
+    exit 1
+fi
+if command -v dpkg-deb &> /dev/null; then
+    dpkg-deb -I "$DEB_FILE" > /dev/null
+    echo "   dpkg-deb 可正常解析 ✔"
 fi
 
-# 完成提示
-echo "🎉 DEB 包打包完成！输出路径：$(pwd)/${OUTPUT_DIR}"
-if [ -n "${DEB_FILE}" ]; then
-    DEB_BASENAME=$(basename "${DEB_FILE}")
-    echo "📝 安装命令: sudo dpkg -i ${OUTPUT_DIR}/${DEB_BASENAME}"
-    echo "📝 或使用: sudo apt install ${OUTPUT_DIR}/${DEB_BASENAME}"
-else
-    echo "📝 安装命令: sudo dpkg -i ${OUTPUT_DIR}/<generated-package>.deb"
-    echo "📝 或使用: sudo apt install ${OUTPUT_DIR}/<generated-package>.deb"
-fi
+echo "🎉 DEB 包打包完成！输出路径：$(pwd)/${DEB_FILE}"
+echo "   架构: ${ARCH}"
+echo "   大小: $(du -h "$DEB_FILE" | cut -f1)"
+command -v sha256sum &> /dev/null && echo "   SHA256: $(sha256sum "$DEB_FILE" | cut -d' ' -f1)"
+echo "📝 安装命令: sudo dpkg -i ${DEB_FILE}"
+echo "📝 或使用: sudo apt install ./${DEB_FILE}"
 echo "📝 卸载命令: sudo dpkg -r easypostman"
